@@ -2,6 +2,7 @@
 
 import tensorflow as tf
 import os
+import sys
 
 
 def generate_tfrecords(input_filename, output_filename):
@@ -34,11 +35,14 @@ def generate_tfrecords(input_filename, output_filename):
 
 
 def main():
-  current_path = os.getcwd()
-  for filename in os.listdir(current_path):
-    if filename.startswith("") and filename.endswith(".libsvm"):
-      generate_tfrecords(filename, filename + ".tfrecords")
-
+  #current_path = os.getcwd()
+  #for filename in os.listdir(current_path):
+  #  if filename.startswith("") and filename.endswith(".libsvm"):
+  #    generate_tfrecords(filename, filename + ".tfrecords")
+  if len(sys.argv) < 2: 
+    print("Usage: PY  libsvm_file. Input args:", sys.argv) 
+    sys.exit(1)
+  generate_tfrecords(sys.argv[1], sys.argv[1] + ".tfrecords")
 
 if __name__ == "__main__":
   main()
