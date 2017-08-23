@@ -2,6 +2,7 @@
 
 import tensorflow as tf
 import os
+import sys
 
 
 def print_tfrecords(input_filename):
@@ -27,7 +28,10 @@ def print_tfrecords(input_filename):
 
 def main():
   current_path = os.getcwd()
-  tfrecords_file_name = "a8a_train.libsvm.tfrecords"
+  if len(sys.argv) < 2:
+    print("Usage: PY  libsvm_file. Input args:", sys.argv)
+    sys.exit(1)
+  tfrecords_file_name = sys.argv[1] #"a8a_train.libsvm.tfrecords"
   input_filename = os.path.join(current_path, tfrecords_file_name)
   print_tfrecords(input_filename)
 

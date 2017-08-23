@@ -98,7 +98,9 @@ def main():
     os.makedirs(OUTPUT_PATH)
   pprint.PrettyPrinter().pprint(FLAGS.__flags)
 
-
+  # dubug: 统计训练处理的样本数
+  sample_size = tf.Variable(0, name="sample_size", trainable=False)
+  sample_inc_op = sample_size.assign_add(FLAGS.batch_size)  #
 
   # Read TFRecords files for training
   def read_and_decode(filename_queue):
@@ -114,10 +116,6 @@ def main():
       num_epochs=EPOCH_NUMBER)
   serialized_example = read_and_decode(filename_queue)
 
-  ## debug: count feature read info.
-  sample_size = tf.Variable(0, name="sample_size", trainable=False)
-  sample_inc_op = sample_size.assign_add(FLAGS.batch_size)
-  #with tf.control_dependencies([sample_inc_op]):
   batch_serialized_example = tf.train.shuffle_batch(
       [serialized_example],
       batch_size=FLAGS.batch_size,
@@ -134,6 +132,8 @@ def main():
   batch_labels = features["label"]
   batch_ids = features["ids"]
   batch_values = features["values"]
+  ## debug: can't print
+  tf.Print(batch_serialized_example, [batch_labels], "debug read label", summarize=10000, first_n=10000)
 
   ## dubug: get tfiles samples:
   #for fn in filename_queue:
@@ -145,11 +145,11 @@ def main():
       tf.train.match_filenames_once(FLAGS.validate_tfrecords_file),
       num_epochs=EPOCH_NUMBER)
   validate_serialized_example = read_and_decode(validate_filename_queue)
-  validate_batch_serialized_example = tf.train.shuffle_batch(
+  validate_batch_serialized_example = tf.train.shuffle_batch(   # 此处只读了100个样本就终止？
       [validate_serialized_example],
       batch_size=FLAGS.validate_batch_size,
       num_threads=BATCH_THREAD_NUMBER,
-
+      capacity=BATCH_CAPACITY,
       min_after_dequeue=MIN_AFTER_DEQUEUE)
   validate_features = tf.parse_example(
       validate_batch_serialized_example,
@@ -241,6 +241,11 @@ def main():
       layer = full_connect(layer,
                            [model_network_hidden_units[-1],
                             output_units], [output_units], is_train)
+    ## debug: 每次加载模型验证显式调用loss 时才触发计算，train_op优化参数时不触发
+    #with tf.control_dependencies([sample_inc_op]): # 两种后置计算依赖方式
+      #layer = tf.identity(layer, name='layer')
+      #layer = tf.Print(layer, [sample_size], "debug sample_size:", summarize=10000, first_n=10000)
+
     return layer
 
   def lr_inference(sparse_ids, sparse_values, is_train=True):
@@ -303,11 +308,11 @@ def main():
   #    tf.cast(train_correct_prediction, tf.float32))
   train_accuracy = tf.reduce_mean(math_ops.abs(math_ops.subtract(train_accuracy_logits,
                                                                  batch_labels)))
-  # debug hug loss problem: cannot print out info.
-  logging.info("step: {}, logits: {}, label: {}, accuracy: {}".format(global_step, train_accuracy_logits, batch_labels, train_accuracy))
-  tf.Print(global_step, [train_accuracy_logits], "train_accuracy_logits:") #, 100)
-  tf.Print(batch_labels, [batch_labels], "batch_labels:") # , 100)
-  tf.Print(train_accuracy, [train_accuracy], "train_accuracy:") #, 100)
+  ## debug hug loss problem: cannot print out info.
+  #logging.info("step: {}, logits: {}, label: {}, accuracy: {}".format(global_step, train_accuracy_logits, batch_labels, train_accuracy))
+  #tf.Print(global_step, [train_accuracy_logits], "train_accuracy_logits:") #, 100)
+  #tf.Print(batch_labels, [batch_labels], "batch_labels:") # , 100)
+  #tf.Print(train_accuracy, [train_accuracy], "train_accuracy:") #, 100)
 
 
   ### Define auc op for train data
@@ -388,9 +393,12 @@ def main():
           if FLAGS.benchmark_mode:
             sess.run(train_op)
           else:
-            _, step = sess.run([train_op, global_step])
+            _, sample_size, step, loss_train = sess.run([
+                train_op, sample_inc_op,  global_step, loss
+            ])
+            logging.info("Step: {}, train loss: {}".format(step, loss_train))
 
-            # Print state while training
+            # Print state while training, 个人理解：此处用模型进行一次预测
             if step % FLAGS.steps_to_validate == 0:
               loss_value, train_accuracy_value, validate_accuracy_value, summary_value = sess.run(
                   [
@@ -399,13 +407,14 @@ def main():
               end_time = datetime.datetime.now()
 
               logging.info(
-                "[{}] Step: {}, global_step: {} loss: {}, train_acc: {},  valid_acc: {}". 
-                  format(end_time - start_time, step, global_step, loss_value,
+                "[{}] Step: {}, sample_size: {} loss: {}, train_acc: {},  valid_acc: {}".
+                  format(end_time - start_time, step, sample_size, loss_value,
                          train_accuracy_value, validate_accuracy_value))
               writer.add_summary(summary_value, step)
               saver.save(sess, CHECKPOINT_FILE, global_step=step)
               start_time = end_time
-      except tf.errors.OutOfRangeError:
+      except tf.errors.OutOfRangeError as e:
+        logging.info("Step: {} catch OutOfRangeErr: {}".format(step, e))
         if FLAGS.benchmark_mode:
           print("Finish training for benchmark")
           exit(0)
