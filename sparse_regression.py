@@ -98,9 +98,11 @@ def main():
     os.makedirs(OUTPUT_PATH)
   pprint.PrettyPrinter().pprint(FLAGS.__flags)
 
-  # dubug: 统计训练处理的样本数
+  # dubug: 统计处理的样本数
   sample_size = tf.Variable(0, name="sample_size", trainable=False)
-  sample_inc_op = sample_size.assign_add(FLAGS.batch_size)  #
+  sample_inc_op = sample_size.assign_add(FLAGS.batch_size)  #  统计训练处理的样本数，对应图的哪一步?
+  validate_size = tf.Variable(0, name="validate_size", trainable=False)
+  validate_inc_op = validate_size.assign_add(FLAGS.batch_size)  
 
   # Read TFRecords files for training
   def read_and_decode(filename_queue):
@@ -133,14 +135,16 @@ def main():
   batch_ids = features["ids"]
   batch_values = features["values"]
   ## debug: can't print
-  tf.Print(batch_serialized_example, [batch_labels], "debug read label", summarize=10000, first_n=10000)
+  #batch_serialized_example = tf.Print(batch_serialized_example, [batch_labels],
+  #                                    "debug read label", summarize=10000, first_n=10000)
 
   ## dubug: get tfiles samples:
   #for fn in filename_queue:
   #  logging.info("sample file: {}, samples: {}".format(fn,
   #               sum(1 for _ in tf.python_io.tf_record_iterator(fn))))
 
-  # Read TFRecords file for validation
+  # Read TFRecords file for validation 
+  ## 异常：不能支持循环读入验证数据集导致抛 OutOfRangeError
   validate_filename_queue = tf.train.string_input_producer(
       tf.train.match_filenames_once(FLAGS.validate_tfrecords_file),
       num_epochs=EPOCH_NUMBER)
@@ -170,7 +174,7 @@ def main():
   def full_connect(inputs, weights_shape, biases_shape, is_train=True):
     with tf.device("/cpu:0"):
       weights = tf.get_variable(
-          "weights", weights_shape, initializer=tf.random_normal_initializer())
+          "weights", weights_shape, initializer=tf.random_normal_initializer(mean=0.0, stddev=0.01)) # math_ops.abs---))
       biases = tf.get_variable(
           "biases", biases_shape, initializer=tf.random_normal_initializer())
       layer = tf.matmul(inputs, weights) + biases
@@ -314,7 +318,6 @@ def main():
   #tf.Print(batch_labels, [batch_labels], "batch_labels:") # , 100)
   #tf.Print(train_accuracy, [train_accuracy], "train_accuracy:") #, 100)
 
-
   ### Define auc op for train data
   #batch_labels = tf.cast(batch_labels, tf.int32)
   #sparse_labels = tf.reshape(batch_labels, [-1, 1])
@@ -380,7 +383,6 @@ def main():
     logging.info("Start to run with mode: {}".format(MODE))
     writer = tf.summary.FileWriter(OUTPUT_PATH, sess.graph)
     sess.run(init_op)
-
     if MODE == "train":
       # Restore session and start queue runner
       restore_session_from_checkpoint(sess, saver, LATEST_CHECKPOINT)
@@ -393,22 +395,23 @@ def main():
           if FLAGS.benchmark_mode:
             sess.run(train_op)
           else:
-            _, sample_size, step, loss_train = sess.run([
-                train_op, sample_inc_op,  global_step, loss
+            _, sample_size, step, tloss, tlabels, tlogit, tmae  = sess.run([
+                train_op, sample_inc_op,  global_step, loss, batch_labels, logits, cross_entropy
             ])
-            logging.info("Step: {}, train loss: {}".format(step, loss_train))
+            logging.info("Step: {}, sample_size: {}, train loss: {}, mae: {}, batch_labels: {}, tpred: {}".format(
+                step, sample_size, tloss, tmae, tlabels[:1], tlogit[:1]))
 
             # Print state while training, 个人理解：此处用模型进行一次预测
             if step % FLAGS.steps_to_validate == 0:
-              loss_value, train_accuracy_value, validate_accuracy_value, summary_value = sess.run(
+              loss_value, train_accuracy_value, validate_accuracy_value, summary_value, validate_size = sess.run(
                   [
-                      loss, train_accuracy, validate_accuracy, summary_op
+                      loss, train_accuracy, validate_accuracy, summary_op, validate_inc_op
                   ])
               end_time = datetime.datetime.now()
 
               logging.info(
-                "[{}] Step: {}, sample_size: {} loss: {}, train_acc: {},  valid_acc: {}".
-                  format(end_time - start_time, step, sample_size, loss_value,
+                "[{}] Step: {}, validate_size: {} loss: {}, train_acc: {},  valid_acc: {}".
+                  format(end_time - start_time, step, validate_size, loss_value,
                          train_accuracy_value, validate_accuracy_value))
               writer.add_summary(summary_value, step)
               saver.save(sess, CHECKPOINT_FILE, global_step=step)
@@ -634,7 +637,7 @@ def get_optimizer(optimizer, learning_rate):
   elif optimizer == "rmsprop":
     return tf.train.RMSPropOptimizer(learning_rate)
   else:
-    logging.error("Unknow optimizer, exit now")
+    logging.error("Unknow optimizer: {}, exit".format(optimizer))
     exit(1)
 
 

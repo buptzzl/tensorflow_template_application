@@ -392,7 +392,8 @@ def main():
               writer.add_summary(summary_value, step)
               saver.save(sess, CHECKPOINT_FILE, global_step=step)
               start_time = end_time
-      except tf.errors.OutOfRangeError:
+      except tf.errors.OutOfRangeError as e:
+        logging.info("Step: {} catch OutOfRangeErr: {}".format(step, e))
         if FLAGS.benchmark_mode:
           print("Finish training for benchmark")
           exit(0)
