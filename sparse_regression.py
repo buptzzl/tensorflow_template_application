@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
+#import json
+#import math
+#from sklearn import metrics
 import datetime
-import json
 import logging
-import math
 import numpy as np
 import os
 import pprint
-from sklearn import metrics
 import tensorflow as tf
 from tensorflow.contrib.session_bundle import exporter
 from tensorflow.python.saved_model import builder as saved_model_builder
@@ -18,6 +18,9 @@ from tensorflow.python.saved_model import tag_constants
 from tensorflow.python.saved_model import utils
 from tensorflow.python.util import compat
 from tensorflow.python.ops import math_ops
+from tensorflow.python import debug as tf_debug
+#import tensorflow.python.debug as tf_debug
+
 
 START_TIME = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 # Define hyperparameters
@@ -69,6 +72,17 @@ flags.DEFINE_string("inference_result_file", "./inference_result.txt",
 flags.DEFINE_boolean("benchmark_mode", False,
                      "Reduce extra computation in benchmark mode")
 
+def variable_summaries(var):
+  """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
+  with tf.name_scope('summaries'):
+    mean = tf.reduce_mean(var)
+    tf.summary.scalar('mean', mean)
+    with tf.name_scope('stddev'):
+        stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+    tf.summary.scalar('stddev', stddev)
+    tf.summary.scalar('max', tf.reduce_max(var))
+    tf.summary.scalar('min', tf.reduce_min(var))
+    tf.summary.histogram('histogram', var)
 
 def main():
   # Get hyperparameters
@@ -109,10 +123,11 @@ def main():
     reader = tf.TFRecordReader()
     _, serialized_example = reader.read(filename_queue)
     # debug:
-    #logging.info("%s read %s instances" % (filename_queue, reader.num_records_produced()))
+    #logging.info("{} read {} instances".format(filename_queue, reader.num_records_produced()))
     return serialized_example
 
   # Read TFRecords files for training
+  ## 每个step取一个batch_size的样本, 总读入样本数=epoch*文件中的样本数，之后抛OutOfRangeError
   filename_queue = tf.train.string_input_producer(
       tf.train.match_filenames_once(FLAGS.train_tfrecords_file),
       num_epochs=EPOCH_NUMBER)
@@ -134,22 +149,14 @@ def main():
   batch_labels = features["label"]
   batch_ids = features["ids"]
   batch_values = features["values"]
-  ## debug: can't print
-  #batch_serialized_example = tf.Print(batch_serialized_example, [batch_labels],
-  #                                    "debug read label", summarize=10000, first_n=10000)
 
-  ## dubug: get tfiles samples:
-  #for fn in filename_queue:
-  #  logging.info("sample file: {}, samples: {}".format(fn,
-  #               sum(1 for _ in tf.python_io.tf_record_iterator(fn))))
-
-  # Read TFRecords file for validation 
-  ## 异常：不能支持循环读入验证数据集导致抛 OutOfRangeError
+  # Read TFRecords file for validation
+  ## 最终读入样本数=epoch*文件中的样本数，之后抛OutOfRangeError. 如果train_size>validate_size, 需要将epoch*倍数因子 
   validate_filename_queue = tf.train.string_input_producer(
       tf.train.match_filenames_once(FLAGS.validate_tfrecords_file),
-      num_epochs=EPOCH_NUMBER)
+      num_epochs=None) # 循环读取而不抛OutOfRange  #  EPOCH_NUMBER) # 读epoch的次数
   validate_serialized_example = read_and_decode(validate_filename_queue)
-  validate_batch_serialized_example = tf.train.shuffle_batch(   # 此处只读了100个样本就终止？
+  validate_batch_serialized_example = tf.train.shuffle_batch(
       [validate_serialized_example],
       batch_size=FLAGS.validate_batch_size,
       num_threads=BATCH_THREAD_NUMBER,
@@ -187,6 +194,10 @@ def main():
             "shift", biases_shape, initializer=tf.random_normal_initializer())
         layer = tf.nn.batch_normalization(layer, mean, var, shift, scale,
                                           FLAGS.bn_epsilon)
+      ## dubug monitor:
+      #variable_summaries(weights)
+      #tf.summary.histogram('biases', biases)
+      #variable_summaries(layer)
     return layer
 
   def sparse_full_connect(sparse_ids,
@@ -198,6 +209,7 @@ def main():
         "weights", weights_shape, initializer=tf.random_normal_initializer())
     biases = tf.get_variable(
         "biases", biases_shape, initializer=tf.random_normal_initializer())
+    #variable_summaries(weights)   ## debug monitor
     return tf.nn.embedding_lookup_sparse(
         weights, sparse_ids, sparse_values, combiner="sum") + biases
 
@@ -234,17 +246,20 @@ def main():
           input_units, model_network_hidden_units[0]
       ], [model_network_hidden_units[0]], is_train)
       layer = tf.nn.relu(sparse_layer)
+      #tf.summary.histogram('input', layer)  # debug
 
     for i in range(len(model_network_hidden_units) - 1):
       with tf.variable_scope("layer{}".format(i)):
         layer = full_connect_relu(layer, [
             model_network_hidden_units[i], model_network_hidden_units[i + 1]
         ], [model_network_hidden_units[i + 1]], is_train)
+        #tf.summary.histogram("layer{}".format(i), layer)  # debug
 
     with tf.variable_scope("output"):
       layer = full_connect(layer,
                            [model_network_hidden_units[-1],
                             output_units], [output_units], is_train)
+      #tf.summary.histogram('output', layer)  # debug
     ## debug: 每次加载模型验证显式调用loss 时才触发计算，train_op优化参数时不触发
     #with tf.control_dependencies([sample_inc_op]): # 两种后置计算依赖方式
       #layer = tf.identity(layer, name='layer')
@@ -283,7 +298,6 @@ def main():
   #cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
   #    logits=logits, labels=batch_labels)
   batch_labels = tf.reshape(batch_labels, [FLAGS.batch_size, FLAGS.label_size]) # 解决label与网络输出logits的维度不匹配异常
-  #logging.info("batch_labels's shape:", batch_labels.shape, "logits shape:", logits.shape) #, str(batch_labels), str(logits))
   cross_entropy = tf.losses.absolute_difference(labels=batch_labels, predictions=logits)
   loss = tf.reduce_mean(cross_entropy, name="loss")
   global_step = tf.Variable(0, name="global_step", trainable=False)
@@ -302,6 +316,11 @@ def main():
   optimizer = get_optimizer(FLAGS.optimizer, learning_rate)
   train_op = optimizer.minimize(loss, global_step=global_step)
   tf.get_variable_scope().reuse_variables()
+  # debug
+  variable_summaries(loss)
+  variable_summaries(logits)
+  #for v in tf.trainable_variables():   # histogram summary for all trainable variables(very slow)
+  #  tf.summary.histogram(v.name, v)
 
   # Define accuracy op for train data
   train_accuracy_logits = inference(batch_ids, batch_values, False)
@@ -348,7 +367,7 @@ def main():
   inference_op = inference_logits
   keys_placeholder = tf.placeholder(tf.int32, shape=[None, 1])
   keys = tf.identity(keys_placeholder)
-  model_signature = {
+  model_signature = { # export(save) the model
       "inputs":
       exporter.generic_signature({
           "keys": keys_placeholder,
@@ -372,14 +391,20 @@ def main():
   #tf.summary.scalar("train_auc", train_auc)
   tf.summary.scalar("validate_accuracy", validate_accuracy)
   #tf.summary.scalar("validate_auc", validate_auc)
-  summary_op = tf.summary.merge_all()
+  summary_op = tf.summary.merge_all()   # 所有Tensorboard 的变量集合
   init_op = [
       tf.global_variables_initializer(),
       tf.local_variables_initializer()
   ]
 
+  #import pdb; pdb.set_trace()
   # Create session to run
   with tf.Session() as sess:
+    ## debug by tfdebug
+    #sess = tf_debug.LocalCLIDebugWrapperSession(sess)
+    # Add a tensor filter (similar to breakpoint)
+    #sess.add_tensor_filter("has_inf_or_nan", tf_debug.has_inf_or_nan)
+
     logging.info("Start to run with mode: {}".format(MODE))
     writer = tf.summary.FileWriter(OUTPUT_PATH, sess.graph)
     sess.run(init_op)
@@ -398,20 +423,22 @@ def main():
             _, sample_size, step, tloss, tlabels, tlogit, tmae  = sess.run([
                 train_op, sample_inc_op,  global_step, loss, batch_labels, logits, cross_entropy
             ])
-            logging.info("Step: {}, sample_size: {}, train loss: {}, mae: {}, batch_labels: {}, tpred: {}".format(
-                step, sample_size, tloss, tmae, tlabels[:1], tlogit[:1]))
+            logging.info("Step: {}, sample_size: {}, train loss: {}, mae: {}, "
+                         "batch_size: {}, label[0]: {}, tpred[0]: {}".format(
+                step, sample_size, tloss, tmae, len(tlabels), tlabels[:1], tlogit[:1]))
 
             # Print state while training, 个人理解：此处用模型进行一次预测
             if step % FLAGS.steps_to_validate == 0:
-              loss_value, train_accuracy_value, validate_accuracy_value, summary_value, validate_size = sess.run(
-                  [
-                      loss, train_accuracy, validate_accuracy, summary_op, validate_inc_op
+              train_accuracy_value, validate_accuracy_value, summary_value, validate_size, vlabels \
+                  = sess.run([
+                      train_accuracy, validate_accuracy, summary_op, validate_inc_op, validate_batch_labels
                   ])
               end_time = datetime.datetime.now()
 
               logging.info(
-                "[{}] Step: {}, validate_size: {} loss: {}, train_acc: {},  valid_acc: {}".
-                  format(end_time - start_time, step, validate_size, loss_value,
+                "[{}] Step: {}, one_validate_size: {}, validate_size: {}, train_acc: {},  "
+                "valid_acc: {}".
+                  format(end_time - start_time, step, len(vlabels), validate_size,
                          train_accuracy_value, validate_accuracy_value))
               writer.add_summary(summary_value, step)
               saver.save(sess, CHECKPOINT_FILE, global_step=step)
