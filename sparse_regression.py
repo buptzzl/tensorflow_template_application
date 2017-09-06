@@ -20,6 +20,9 @@ from tensorflow.python.util import compat
 from tensorflow.python.ops import math_ops
 from tensorflow.python import debug as tf_debug
 #import tensorflow.python.debug as tf_debug
+from tensorflow.python.ops import variable_scope
+from tensorflow.python.framework import dtypes
+from tensorflow.python.ops import init_ops
 
 
 START_TIME = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -50,7 +53,7 @@ flags.DEFINE_string("checkpoint_path", "./checkpoint/" + START_TIME,
 flags.DEFINE_string("output_path", "output/" + START_TIME,
                     "The path of tensorboard event files")
 flags.DEFINE_string("model", "dnn", "Support dnn, lr, wide_and_deep")
-flags.DEFINE_string("model_network", "128 32 8", "The neural network of model")
+flags.DEFINE_string("model_network", "128 32 8", "The dnn model's per-layer size")
 flags.DEFINE_boolean("enable_bn", False, "Enable batch normalization or not")
 flags.DEFINE_float("bn_epsilon", 0.001, "The epsilon of batch normalization")
 flags.DEFINE_boolean("enable_dropout", False, "Enable dropout or not")
@@ -72,9 +75,9 @@ flags.DEFINE_string("inference_result_file", "./inference_result.txt",
 flags.DEFINE_boolean("benchmark_mode", False,
                      "Reduce extra computation in benchmark mode")
 
-def variable_summaries(var):
+def variable_summaries(var, name):
   """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
-  with tf.name_scope('summaries'):
+  with tf.name_scope(name):
     mean = tf.reduce_mean(var)
     tf.summary.scalar('mean', mean)
     with tf.name_scope('stddev'):
@@ -85,12 +88,14 @@ def variable_summaries(var):
     tf.summary.histogram('histogram', var)
 
 def main():
-  # Get hyperparameters
   if FLAGS.enable_colored_log:
     import coloredlogs
     coloredlogs.install()
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(lineno)d %(message)s")
   FEATURE_SIZE = FLAGS.feature_size
+  #print("params2: %s" % FLAGS.__flags)
+  for k, v in FLAGS.__flags.items():    # 必须在取出一个具体的配置后才打印所有配置
+    logging.info("param: {}={}".format(k, v))
   LABEL_SIZE = FLAGS.label_size
   EPOCH_NUMBER = FLAGS.epoch_number
   if EPOCH_NUMBER <= 0:
@@ -116,7 +121,7 @@ def main():
   sample_size = tf.Variable(0, name="sample_size", trainable=False)
   sample_inc_op = sample_size.assign_add(FLAGS.batch_size)  #  统计训练处理的样本数，对应图的哪一步?
   validate_size = tf.Variable(0, name="validate_size", trainable=False)
-  validate_inc_op = validate_size.assign_add(FLAGS.batch_size)  
+  validate_inc_op = validate_size.assign_add(FLAGS.validate_batch_size)
 
   # Read TFRecords files for training
   def read_and_decode(filename_queue):
@@ -151,7 +156,7 @@ def main():
   batch_values = features["values"]
 
   # Read TFRecords file for validation
-  ## 最终读入样本数=epoch*文件中的样本数，之后抛OutOfRangeError. 如果train_size>validate_size, 需要将epoch*倍数因子 
+  ## 最终读入样本数=epoch*文件中的样本数，之后抛OutOfRangeError. 如果train_size>validate_size, 需要将epoch*倍数因子
   validate_filename_queue = tf.train.string_input_producer(
       tf.train.match_filenames_once(FLAGS.validate_tfrecords_file),
       num_epochs=None) # 循环读取而不抛OutOfRange  #  EPOCH_NUMBER) # 读epoch的次数
@@ -189,9 +194,9 @@ def main():
       if FLAGS.enable_bn and is_train:
         mean, var = tf.nn.moments(layer, axes=[0])
         scale = tf.get_variable(
-            "scale", biases_shape, initializer=tf.random_normal_initializer())
+            "scale", biases_shape, initializer=tf.random_normal_initializer(stddev=0.01))
         shift = tf.get_variable(
-            "shift", biases_shape, initializer=tf.random_normal_initializer())
+            "shift", biases_shape, initializer=tf.random_normal_initializer(stddev=0.01))
         layer = tf.nn.batch_normalization(layer, mean, var, shift, scale,
                                           FLAGS.bn_epsilon)
       ## dubug monitor:
@@ -206,7 +211,7 @@ def main():
                           biases_shape,
                           is_train=True):
     weights = tf.get_variable(
-        "weights", weights_shape, initializer=tf.random_normal_initializer())
+        "weights", weights_shape, initializer=tf.random_normal_initializer(stddev=0.01))
     biases = tf.get_variable(
         "biases", biases_shape, initializer=tf.random_normal_initializer())
     #variable_summaries(weights)   ## debug monitor
@@ -253,13 +258,17 @@ def main():
         layer = full_connect_relu(layer, [
             model_network_hidden_units[i], model_network_hidden_units[i + 1]
         ], [model_network_hidden_units[i + 1]], is_train)
-        #tf.summary.histogram("layer{}".format(i), layer)  # debug
+        if is_train:
+          #tf.summary.histogram("layer{}".format(i), layer)  # debug
+          variable_summaries(layer, "l-%s" % (i)) # 已经在子命名空间下，不需再命名 layer{}_detail".format(i))
 
     with tf.variable_scope("output"):
       layer = full_connect(layer,
                            [model_network_hidden_units[-1],
                             output_units], [output_units], is_train)
-      #tf.summary.histogram('output', layer)  # debug
+      if is_train:
+        #tf.summary.histogram('output', layer)  # debug, 在预测时调用会跑shape(-1,..)异常
+        variable_summaries(layer, "out") # 不需要再重复命名
     ## debug: 每次加载模型验证显式调用loss 时才触发计算，train_op优化参数时不触发
     #with tf.control_dependencies([sample_inc_op]): # 两种后置计算依赖方式
       #layer = tf.identity(layer, name='layer')
@@ -298,9 +307,21 @@ def main():
   #cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
   #    logits=logits, labels=batch_labels)
   batch_labels = tf.reshape(batch_labels, [FLAGS.batch_size, FLAGS.label_size]) # 解决label与网络输出logits的维度不匹配异常
-  cross_entropy = tf.losses.absolute_difference(labels=batch_labels, predictions=logits)
+  #cross_entropy = tf.losses.absolute_difference(labels=batch_labels, predictions=logits,
+  #                                              reduction="none") # 不按加和聚合
+  ## 尝试poisson &(how 负二项分布回归?)
+  ##pred_lambda = math_ops.exp(logits)  # (2.718282, logits)
+  cross_entropy = tf.nn.log_poisson_loss(targets=batch_labels, log_input=logits, # pred_lambda,
+                                         name="poisson_loss")
   loss = tf.reduce_mean(cross_entropy, name="loss")
-  global_step = tf.Variable(0, name="global_step", trainable=False)
+
+  ## 打印梯度
+  #global_step = tf.Variable(0, name="global_step", trainable=False)
+  global_step = variable_scope.get_variable(  # this needs to be defined for tf.contrib.layers.optimize_loss()
+    "global_step", [],
+    trainable=False,
+    dtype=dtypes.int64,
+    initializer=init_ops.constant_initializer(0, dtype=dtypes.int64))
   if FLAGS.enable_lr_decay:
     logging.info(
         "Enable learning rate decay rate: {}".format(FLAGS.lr_decay_rate))
@@ -313,12 +334,12 @@ def main():
         staircase=True)
   else:
     learning_rate = FLAGS.learning_rate
-  optimizer = get_optimizer(FLAGS.optimizer, learning_rate)
-  train_op = optimizer.minimize(loss, global_step=global_step)
+  #optimizer = get_optimizer(FLAGS.optimizer, learning_rate)
+  #train_op = optimizer.minimize(loss, global_step=global_step)
+  ## 打印梯度
+  train_op = tf.contrib.layers.optimize_loss(loss, global_step, learning_rate=learning_rate,
+                                             optimizer='Adam', summaries=["gradients"])
   tf.get_variable_scope().reuse_variables()
-  # debug
-  variable_summaries(loss)
-  variable_summaries(logits)
   #for v in tf.trainable_variables():   # histogram summary for all trainable variables(very slow)
   #  tf.summary.histogram(v.name, v)
 
@@ -331,22 +352,6 @@ def main():
   #    tf.cast(train_correct_prediction, tf.float32))
   train_accuracy = tf.reduce_mean(math_ops.abs(math_ops.subtract(train_accuracy_logits,
                                                                  batch_labels)))
-  ## debug hug loss problem: cannot print out info.
-  #logging.info("step: {}, logits: {}, label: {}, accuracy: {}".format(global_step, train_accuracy_logits, batch_labels, train_accuracy))
-  #tf.Print(global_step, [train_accuracy_logits], "train_accuracy_logits:") #, 100)
-  #tf.Print(batch_labels, [batch_labels], "batch_labels:") # , 100)
-  #tf.Print(train_accuracy, [train_accuracy], "train_accuracy:") #, 100)
-
-  ### Define auc op for train data
-  #batch_labels = tf.cast(batch_labels, tf.int32)
-  #sparse_labels = tf.reshape(batch_labels, [-1, 1])
-  #derived_size = tf.shape(batch_labels)[0]
-  #indices = tf.reshape(tf.range(0, derived_size, 1), [-1, 1])
-  #concated = tf.concat(axis=1, values=[indices, sparse_labels])
-  #outshape = tf.stack([derived_size, LABEL_SIZE])
-  #new_train_batch_labels = tf.sparse_to_dense(concated, outshape, 1.0, 0.0)
-  #_, train_auc = tf.contrib.metrics.streaming_auc(train_softmax,
-  #                                                new_train_batch_labels)
 
   # Define accuracy op for validate data
   validate_accuracy_logits = inference(validate_batch_ids,
@@ -386,9 +391,14 @@ def main():
 
   # Initialize saver and summary
   saver = tf.train.Saver()
-  tf.summary.scalar("loss", loss)
+  # debug
+  variable_summaries(loss, "loss_detail")
+  variable_summaries(logits, "logits_detail")
+  #tf.summary.scalar("loss", loss)
   tf.summary.scalar("train_accuracy", train_accuracy)
   #tf.summary.scalar("train_auc", train_auc)
+  variable_summaries(validate_accuracy_logits, "validate_loss_detail")
+  variable_summaries(validate_batch_labels, "validate_label_detail")
   tf.summary.scalar("validate_accuracy", validate_accuracy)
   #tf.summary.scalar("validate_auc", validate_auc)
   summary_op = tf.summary.merge_all()   # 所有Tensorboard 的变量集合
@@ -401,9 +411,9 @@ def main():
   # Create session to run
   with tf.Session() as sess:
     ## debug by tfdebug
-    #sess = tf_debug.LocalCLIDebugWrapperSession(sess)
+    sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     # Add a tensor filter (similar to breakpoint)
-    #sess.add_tensor_filter("has_inf_or_nan", tf_debug.has_inf_or_nan)
+    sess.add_tensor_filter("has_inf_or_nan", tf_debug.has_inf_or_nan)
 
     logging.info("Start to run with mode: {}".format(MODE))
     writer = tf.summary.FileWriter(OUTPUT_PATH, sess.graph)
@@ -420,26 +430,29 @@ def main():
           if FLAGS.benchmark_mode:
             sess.run(train_op)
           else:
-            _, sample_size, step, tloss, tlabels, tlogit, tmae  = sess.run([
+            _, sample_size, step, tloss, tlabels, tlogit, tmae = sess.run([
                 train_op, sample_inc_op,  global_step, loss, batch_labels, logits, cross_entropy
             ])
-            logging.info("Step: {}, sample_size: {}, train loss: {}, mae: {}, "
-                         "batch_size: {}, label[0]: {}, tpred[0]: {}".format(
-                step, sample_size, tloss, tmae, len(tlabels), tlabels[:1], tlogit[:1]))
+            logging.info("Step: {}, sample_size: {}, train loss: {}, batch_size: {}, \n"
+                         "label:\t {},\npred:\t {},\nloss:\t {}".format(
+                step, sample_size, tloss, len(tlabels),
+                str(tlabels[:10]).replace('\n', ''), str(tlogit[:10]).replace('\n', ''),
+                str(tmae[:10]).replace('\n', '')))
 
             # Print state while training, 个人理解：此处用模型进行一次预测
             if step % FLAGS.steps_to_validate == 0:
-              train_accuracy_value, validate_accuracy_value, summary_value, validate_size, vlabels \
+              train_accuracy_value, validate_accuracy_value, summary_value, vlabels, vpred \
                   = sess.run([
-                      train_accuracy, validate_accuracy, summary_op, validate_inc_op, validate_batch_labels
+                      train_accuracy, validate_accuracy, summary_op, validate_batch_labels, validate_accuracy_logits
                   ])
               end_time = datetime.datetime.now()
 
               logging.info(
-                "[{}] Step: {}, one_validate_size: {}, validate_size: {}, train_acc: {},  "
-                "valid_acc: {}".
-                  format(end_time - start_time, step, len(vlabels), validate_size,
-                         train_accuracy_value, validate_accuracy_value))
+                "[{}] Step: {}, one_validate_size: {}, train_acc: {}, valid_acc: {}\n"
+                "vlabel:\t {},\nvpred:\t {}".
+                  format(end_time - start_time, step, len(vlabels),
+                         train_accuracy_value, validate_accuracy_value,
+                         str(vlabels[:10]).replace('\n', ''), str(vpred[:10]).replace('\n', '')))
               writer.add_summary(summary_value, step)
               saver.save(sess, CHECKPOINT_FILE, global_step=step)
               start_time = end_time
